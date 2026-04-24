@@ -1,3 +1,9 @@
+"""TimescaleDB writer for inference results.
+
+Persists API failure predictions to a hypertable with idempotent upsert logic
+based on 1-minute time buckets. Automatically creates schema and indexes on
+first connection.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -12,6 +18,19 @@ from app.config import Settings
 
 @dataclass
 class PredictionRecord:
+    """Single API failure prediction to persist to database.
+    
+    Attributes:
+        time: Timestamp of prediction.
+        org_id, api_id, endpoint, method: Endpoint identifier (UUIDs/strings).
+        risk_score: Failure probability [0.0, 1.0].
+        prediction: Risk category (normal/degraded/high_failure_risk).
+        confidence: Model confidence [0.5, 1.0].
+        top_features: List of {feature: str, contribution: float, abs_contribution: float}.
+        model_version, feature_schema_version: Versions for auditing/migration.
+        model_hash: Hash of model artifact.
+        is_warmed_up: Whether endpoint had sufficient history for this prediction.
+    """
     time: datetime
     org_id: str
     api_id: str
@@ -28,12 +47,24 @@ class PredictionRecord:
 
 
 class TimescaleWriter:
+    """Manages connection to TimescaleDB and writes API failure predictions.
+    
+    Creates hypertable on first instantiation with idempotent upsert logic
+    based on (org_id, api_id, endpoint, method, time_bucket) conflict key.
+    Buckets time to nearest minute to handle late/duplicate deliveries.
+    """
     def __init__(self, settings: Settings) -> None:
+        """Connect to TimescaleDB and ensure api_failure_predictions schema exists.
+        
+        Args:
+            settings: Configuration with timescale_database connection string.
+        """
         self._conn = psycopg2.connect(settings.timescale_database)
         self._conn.autocommit = False
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
+        """Create hypertable and indexes if they don't exist (idempotent operation)."""
         with self._conn.cursor() as cursor:
             cursor.execute(
                 """
@@ -89,6 +120,14 @@ class TimescaleWriter:
 
 
     def write_predictions(self, records: list[PredictionRecord]) -> None:
+        """Batch write predictions with idempotent upsert (handles duplicates gracefully).
+        
+        Uses ON CONFLICT with GREATEST() for risk_score to preserve highest risk
+        if duplicate predictions arrive for same endpoint in same minute.
+        
+        Args:
+            records: List of PredictionRecord objects to write (no-op if empty).
+        """
         if not records:
             return
 
@@ -148,4 +187,5 @@ class TimescaleWriter:
 
 
     def close(self) -> None:
+        """Close database connection."""
         self._conn.close()

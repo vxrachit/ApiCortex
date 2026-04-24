@@ -1,3 +1,9 @@
+"""Async ML inference worker for continuous telemetry processing.
+
+Main event loop that consumes Kafka batches, validates telemetry events,
+computes features, runs predictions, and persists results to TimescaleDB
+with alert publishing. Implements graceful shutdown with signal handling.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +27,7 @@ from app.storage.timescale_writer import PredictionRecord, TimescaleWriter
 
 
 class JsonFormatter(logging.Formatter):
+    """JSON-formatted logger for structured logging in production."""
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "timestamp": datetime.now(UTC).isoformat(),
@@ -34,6 +41,14 @@ class JsonFormatter(logging.Formatter):
 
 
 def configure_logging(level: str) -> logging.Logger:
+    """Configure JSON logger for structured logging to stdout.
+    
+    Args:
+        level: Log level string (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        
+    Returns:
+        Configured logger instance.
+    """
     logger = logging.getLogger("apicortex.ml-worker")
     logger.setLevel(level)
     logger.handlers.clear()
@@ -47,6 +62,11 @@ def configure_logging(level: str) -> logging.Logger:
 
 @dataclass
 class WorkerMetrics:
+    """Cumulative metrics for worker lifecycle (does not reset on restart).
+    
+    Tracks batches processed, events ingested, predictions written, and errors
+    for observability and debugging.
+    """
     batches_processed: int = 0
     events_processed: int = 0
     predictions_written: int = 0
@@ -60,7 +80,11 @@ class WorkerMetrics:
 
 @dataclass
 class RetryConfig:
-    """Configuration for exponential backoff retry logic."""
+    """Configuration for exponential backoff retry logic.
+    
+    Used when writing predictions to database fails, backing off gradually
+    to avoid cascade failures.
+    """
     max_retries: int = 3
     initial_backoff_seconds: float = 0.1
     max_backoff_seconds: float = 30.0
@@ -68,14 +92,17 @@ class RetryConfig:
 
 
 class AlertDeliveryTracker:
-    """Tracks alert delivery confirmations."""
+    """Tracks alert delivery confirmations from Kafka producer.
+    
+    Currently a placeholder for future async delivery tracking (not fully used).
+    """
     def __init__(self) -> None:
         self.pending_alerts: dict[int, dict] = {}
         self.delivery_errors: list[str] = []
         self._lock = asyncio.Lock()
 
     async def on_delivery(self, err, msg) -> None:
-        """Callback invoked on alert delivery confirmation."""
+        """Callback invoked on alert delivery confirmation (success or failure)."""
         async with self._lock:
             if err:
                 self.delivery_errors.append(str(err))
@@ -84,7 +111,18 @@ class AlertDeliveryTracker:
 
 
 class InferenceWorker:
+    """Main async worker orchestrating end-to-end telemetry-to-prediction pipeline.
+    
+    Polls Kafka for telemetry batches, validates/decompresses messages, computes
+    features, runs XGBoost inference, publishes high-risk alerts, and writes
+    predictions to TimescaleDB. Implements graceful shutdown with signal handlers.
+    """
     def __init__(self, settings: Settings) -> None:
+        """Initialize worker with configuration and load model/components.
+        
+        Args:
+            settings: Configuration from environment variables.
+        """
         self.settings = settings
         self.logger = configure_logging(settings.log_level)
 
@@ -107,10 +145,11 @@ class InferenceWorker:
         self._shutdown = asyncio.Event()
 
     def request_shutdown(self) -> None:
+        """Signal worker to gracefully shutdown the main loop."""
         self._shutdown.set()
 
     async def _validate_uuids(self, org_id: str, api_id: str) -> bool:
-        """Validate that org_id and api_id are valid UUIDs."""
+        """Check if both org_id and api_id are valid UUID format."""
         import uuid as uuid_module
         try:
             uuid_module.UUID(org_id)
@@ -125,7 +164,20 @@ class InferenceWorker:
         *args,
         **kwargs
     ) -> Any:
-        """Retry async function with exponential backoff."""
+        """Retry async function with exponential backoff (max_retries + 1 attempts).
+        
+        Logs warnings on retry attempts, re-raises last exception if all retries fail.
+        
+        Args:
+            func: Async callable to retry.
+            *args, **kwargs: Arguments to pass to func.
+            
+        Returns:
+            Return value from func.
+            
+        Raises:
+            Last exception encountered if all retries exhausted.
+        """
         backoff = self.retry_config.initial_backoff_seconds
         last_error = None
 
@@ -147,6 +199,11 @@ class InferenceWorker:
 
 
     async def run(self) -> None:
+        """Main async worker loop: poll Kafka, process batches, until shutdown requested.
+        
+        Polls telemetry topic, decodes messages, validates events, computes features,
+        runs predictions, publishes alerts, and writes to database. Handles Kafka
+        failures gracefully with retries. Offset only committed on full success."""
         self.logger.info("ML inference worker started")
 
         while not self._shutdown.is_set():
@@ -202,7 +259,18 @@ class InferenceWorker:
         await self._shutdown_cleanup()
 
     async def _handle_message(self, message: Message) -> None:
-        """Process a single Kafka message with proper error handling and commit semantics."""
+        """Process single Kafka message: decode, validate, predict, persist, commit.
+        
+        Handles partial batch failures: invalid events sent to DLQ but batch
+        continues processing. Database write must succeed for offset commit.
+        Alert publish failures are logged but don't block commit.
+        
+        Args:
+            message: Kafka message from telemetry topic.
+            
+        Raises:
+            Exception if database write fails (offset not committed, message reprocessed).
+        """
         consume_started = time.perf_counter()
         kafka_lag = await asyncio.to_thread(self.consumer.lag_for_message, message)
 
@@ -347,14 +415,15 @@ class InferenceWorker:
         )
 
     async def _write_predictions_async(self, records: list[PredictionRecord]) -> None:
-        """Async wrapper for writing predictions."""
+        """Async wrapper for database write (runs in thread pool to avoid blocking)."""
         await asyncio.to_thread(self.writer.write_predictions, records)
 
     async def _publish_alert_async(self, alert: dict[str, Any]) -> None:
-        """Async wrapper for publishing alerts."""
+        """Async wrapper for alert publishing (runs in thread pool)."""
         await asyncio.to_thread(self.consumer.publish_alert, alert)
 
     async def _shutdown_cleanup(self) -> None:
+        """Gracefully close all connections: flush alerts, close database, close Kafka."""
         self.logger.info("Shutting down ML inference worker")
         await asyncio.to_thread(self.consumer.flush_producer)
         await asyncio.to_thread(self.writer.close)
@@ -362,6 +431,7 @@ class InferenceWorker:
 
 
 def install_signal_handlers(worker: InferenceWorker) -> None:
+    """Register SIGINT and SIGTERM handlers to trigger graceful worker shutdown."""
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:

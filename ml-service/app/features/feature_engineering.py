@@ -1,3 +1,9 @@
+"""Feature engineering for API failure prediction.
+
+Maintains rolling windows of telemetry events per endpoint, computing
+time-series features (latency, error rate, traffic, schema changes) for
+model inference. Handles late/out-of-order events and warm-up tracking.
+"""
 from __future__ import annotations
 
 import json
@@ -40,6 +46,7 @@ FEATURE_COLUMNS = [
 
 @dataclass(frozen=True)
 class EventKey:
+    """Unique identifier for an API endpoint (org + api + path + method)."""
     org_id: str
     api_id: str
     endpoint: str
@@ -48,6 +55,7 @@ class EventKey:
 
 @dataclass(frozen=True)
 class EventSnapshot:
+    """Single raw telemetry event snapshot for feature computation."""
     timestamp: datetime
     status: int
     latency_ms: int
@@ -56,6 +64,14 @@ class EventSnapshot:
 
 @dataclass
 class FeatureRow:
+    """Computed features for one endpoint at a point in time.
+    
+    Attributes:
+        time: Timestamp when features were computed (latest event time).
+        org_id, api_id, endpoint, method: Endpoint identifier.
+        features: Dict mapping feature names to float values.
+        is_warmed_up: Whether endpoint has sufficient history for predictions.
+    """
     time: datetime
     org_id: str
     api_id: str
@@ -66,9 +82,20 @@ class FeatureRow:
 
 
 class RollingFeatureEngineer:
-    """Maintains per-endpoint rolling state and computes model features with warm-up tracking."""
+    """Maintains per-endpoint rolling state and computes model features with warm-up tracking.
+    
+    Accumulates telemetry events in sliding windows, tracks late/out-of-order
+    events, and computes 11 time-series features for each endpoint. Monitors
+    when endpoints have enough history (MIN_EVENTS_FOR_WARMUP) for stable
+    predictions.
+    """
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
+        """Initialize feature engineer with empty history and metrics.
+        
+        Args:
+            logger: Optional logger for debug/info messages (default: module logger).
+        """
         self._history: dict[EventKey, Deque[EventSnapshot]] = defaultdict(deque)
         self._event_counts: dict[EventKey, int] = defaultdict(int)
         self._is_warmed_up: dict[EventKey, bool] = {}
@@ -103,7 +130,14 @@ class RollingFeatureEngineer:
         return event_time < max_time
 
     def bootstrap_from_state(self, state: dict[str, Any]) -> None:
-        """Load rolling history from persisted state."""
+        """Restore rolling history from persisted checkpoint state.
+        
+        Useful after restarts to continue using accumulated history rather
+        than starting cold. Logs if restoration encounters errors.
+        
+        Args:
+            state: Dict exported by export_state() method.
+        """
         try:
             for key_dict, events_data in state.get("history", {}).items():
                 key = EventKey(**json.loads(key_dict))
@@ -148,7 +182,11 @@ class RollingFeatureEngineer:
             })
 
     def export_state(self) -> dict[str, Any]:
-        """Export rolling history for persistence across restarts."""
+        """Serialize rolling history and metrics for persistence across restarts.
+        
+        Returns:
+            Dict with history, event_counts, warm-up flags, and timing metrics.
+        """
         return {
             "history": {
                 json.dumps({"org_id": k.org_id, "api_id": k.api_id, "endpoint": k.endpoint, "method": k.method}): [
@@ -181,6 +219,18 @@ class RollingFeatureEngineer:
 
 
     def ingest(self, events: list[TelemetryEvent]) -> list[FeatureRow]:
+        """Process batch of telemetry events and compute features for all touched endpoints.
+        
+        Handles late/out-of-order event filtering, maintains rolling windows,
+        updates warm-up status, and computes feature vectors. Returns one
+        FeatureRow per endpoint that received new events.
+        
+        Args:
+            events: List of validated TelemetryEvent objects to ingest.
+            
+        Returns:
+            List of FeatureRow objects (one per unique endpoint in batch).
+        """
         if not events:
             return []
 
@@ -269,16 +319,31 @@ class RollingFeatureEngineer:
         return rows
 
     def _prune_old(self, key: EventKey, now: datetime) -> None:
+        """Remove events older than 15-minute window to manage memory."""
         cutoff = now - WINDOW_15M
         queue = self._history[key]
         while queue and queue[0].timestamp < cutoff:
             queue.popleft()
 
     def _events_in_window(self, key: EventKey, now: datetime, window: timedelta) -> list[EventSnapshot]:
+        """Get events within sliding window relative to 'now' timestamp."""
         cutoff = now - window
         return [event for event in self._history[key] if event.timestamp >= cutoff]
 
     def _compute_features(self, key: EventKey, now: datetime) -> dict[str, float]:
+        """Compute 11 time-series features from endpoint's rolling event history.
+        
+        Features include: latency percentiles/variance/delta, error rate/delta,
+        traffic rate/delta, and schema change indicators. Handles missing data
+        by replacing inf/nan with 0.0.
+        
+        Args:
+            key: Endpoint identifier.
+            now: Reference timestamp for window calculations.
+            
+        Returns:
+            Dict mapping feature names to float values.
+        """
         events_1m = self._events_in_window(key, now, WINDOW_1M)
         events_5m = self._events_in_window(key, now, WINDOW_5M)
         events_15m = self._events_in_window(key, now, WINDOW_15M)
@@ -322,6 +387,14 @@ class RollingFeatureEngineer:
 
     @staticmethod
     def _error_rate(events: list[EventSnapshot]) -> float:
+        """Calculate error rate as proportion of 5xx responses.
+        
+        Args:
+            events: List of event snapshots.
+            
+        Returns:
+            Error rate in [0.0, 1.0] or 0.0 if no events.
+        """
         if not events:
             return 0.0
         error_count = sum(1 for event in events if event.status >= 500)
@@ -329,6 +402,11 @@ class RollingFeatureEngineer:
 
     @staticmethod
     def _schema_change_features(events: list[EventSnapshot]) -> tuple[float, float, float]:
+        """Detect schema changes (hash changes) and breaking changes (hash change + error).
+        
+        Returns:
+            Tuple of (fields_added, fields_removed, breaking_changes).
+        """
         if len(events) < 2:
             return 0.0, 0.0, 0.0
 

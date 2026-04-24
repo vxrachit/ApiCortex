@@ -1,3 +1,8 @@
+"""Configuration management for ML service.
+
+Loads and validates environment variables, providing Kafka and database
+connection details, model paths, and inference thresholds.
+"""
 from __future__ import annotations
 
 import os
@@ -10,6 +15,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 
 
 class Settings(BaseModel):
+    """Application settings loaded from environment variables.
+    
+    Validates all configuration on instantiation, ensuring required fields
+    are present, TLS certificates are either all provided or all absent,
+    and model paths resolve correctly relative to the service root.
+    """
     kafka_service_uri: str = Field(validation_alias="KAFKA_SERVICE_URI")
     kafka_ca_cert: str | None = Field(default=None, validation_alias="KAFKA_CA_CERT")
     kafka_service_cert: str | None = Field(default=None, validation_alias="KAFKA_SERVICE_CERT")
@@ -79,10 +90,12 @@ class Settings(BaseModel):
 
     @property
     def kafka_brokers(self) -> list[str]:
+        """Parse Kafka service URI into list of individual broker addresses."""
         return [broker.strip() for broker in self.kafka_service_uri.split(",") if broker.strip()]
 
     @property
     def consumer_config(self) -> dict[str, object]:
+        """Build librdkafka consumer configuration dictionary."""
         config: dict[str, object] = {
             "bootstrap.servers": ",".join(self.kafka_brokers),
             "group.id": self.kafka_group_id,
@@ -96,6 +109,7 @@ class Settings(BaseModel):
 
     @property
     def producer_config(self) -> dict[str, object]:
+        """Build librdkafka producer configuration dictionary with idempotent delivery."""
         config: dict[str, object] = {
             "bootstrap.servers": ",".join(self.kafka_brokers),
             "acks": "all",

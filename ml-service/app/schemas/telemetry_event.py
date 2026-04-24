@@ -1,3 +1,10 @@
+"""Pydantic schema for API telemetry events.
+
+Validates telemetry payloads from ingest service, enforcing UUID format,
+HTTP status range, and field value constraints. Supports both legacy
+(request_size/response_size) and current (request_size_bytes/response_size_bytes)
+field names.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -7,6 +14,22 @@ from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 
 class TelemetryEvent(BaseModel):
+    """API telemetry event for feature engineering and prediction.
+    
+    Represents a single API request/response observation with timing, status,
+    and schema information for failure risk detection.
+    
+    Attributes:
+        timestamp: When the request was made.
+        org_id, api_id: Organization and API identifiers (must be valid UUIDs).
+        endpoint: API endpoint path (e.g., '/users/123').
+        method: HTTP method in uppercase (GET, POST, etc.).
+        status: HTTP response status code [100-599].
+        latency_ms: Request-to-response time in milliseconds (non-negative).
+        request_size_bytes, response_size_bytes: Message sizes (non-negative).
+        schema_hash: Optional hash of OpenAPI schema for change detection.
+        schema_version: Optional OpenAPI version identifier.
+    """
     timestamp: datetime
     org_id: str
     api_id: str
